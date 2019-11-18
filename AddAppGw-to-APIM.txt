@@ -1,0 +1,54 @@
+﻿Login-AzureRmAccount
+Select-AzureRmSubscription -SubscriptionName "Corp Test"
+
+$apimRg = "core-apim"
+$apimName = "contosoapimgmt"
+$vNetRg = "core-netwrk-weu-rg"
+$vNetName = "core-netwk-weu-vnet"
+$proxyDomainName = "api.contoso.net"
+$certPath = "C:\Code\api.contoso.net.pfx"
+$cerFilePath = "C:\Code\api.contoso.net.cer"
+$certPwd = "password"
+
+# Get APIM Instance
+$apimService = Get-AzureRmApiManagement -ResourceGroupName $apimRg -Name $apimName
+
+# Setup Cert for APIM
+$cert = New-SelfSignedCertificate -CertStoreLocation "cert:\localmachine\my" -DnsName $proxyDomainName
+$pwd = ConvertTo-SecureString -String $certPwd -Force -AsPlainText
+$path = 'cert:\localMachine\my\' + $cert.thumbprint 
+Export-PfxCertificate -cert $path -FilePath $certPath -Password $pwd
+
+$certUploadResult = Import-AzureRmApiManagementHostnameCertificate -ResourceGroupName $apimRg -Name $apimName -HostnameType "Proxy" -PfxPath $certPath -PfxPassword $certPwd -PassThru
+
+$proxyHostnameConfig = New-AzureRmApiManagementHostnameConfiguration -CertificateThumbprint $certUploadResult.Thumbprint -Hostname $proxyDomainName
+$result = Set-AzureRmApiManagementHostnames -Name $apimName -ResourceGroupName $apimRg -ProxyHostnameConfiguration $proxyHostnameConfig
+
+# Setup AppGw
+$vNet = Get-AzureRmVirtualNetwork -Name $vNetName -ResourceGroupName $vNetRg
+
+# ADJUST WITH CORRECT SUBNET NUMBER
+$gatewaySubnet = $vNet.Subnets[2] 
+
+$publicip = New-AzureRmPublicIpAddress -ResourceGroupName $apimRg -name "AppGwpublicIP01" -location "West Europe" -AllocationMethod Dynamic
+$publicip = Get-AzureRmPublicIpAddress -ResourceGroupName $apimRg -Name "AppGwpublicIP01"
+
+$gipconfig = New-AzureRmApplicationGatewayIPConfiguration -Name "AppGwIP01" -Subnet $gatewaySubnet
+$fp01 = New-AzureRmApplicationGatewayFrontendPort -Name "port01"  -Port 443
+$fipconfig01 = New-AzureRmApplicationGatewayFrontendIPConfig -Name "frontend1" -PublicIPAddress $publicip
+$cert = New-AzureRmApplicationGatewaySslCertificate -Name "cert01" -CertificateFile $certPath -Password $certPwd
+$listener = New-AzureRmApplicationGatewayHttpListener -Name "listener01" -Protocol "Https" -FrontendIPConfiguration $fipconfig01 -FrontendPort $fp01 -SslCertificate $cert -
+$apimprobe = New-AzureRmApplicationGatewayProbeConfig -Name "apimproxyprobe" -Protocol "Https" -HostName "api.contoso.net" -Path "/status-0123456789abcdef" -Interval 30 -Timeout 120 -UnhealthyThreshold 8
+$authcert = New-AzureRmApplicationGatewayAuthenticationCertificate -Name "whitelistcert1" -CertificateFile $cerFilePath
+$apimPoolSetting = New-AzureRmApplicationGatewayBackendHttpSettings -Name "apimPoolSetting" -Port 443 -Protocol "Https" -CookieBasedAffinity "Disabled" -Probe $apimprobe -AuthenticationCertificates $authcert -RequestTimeout 180
+$apimProxyBackendPool = New-AzureRmApplicationGatewayBackendAddressPool -Name "apimbackend" -BackendIPAddresses $apimService.StaticIPs[0]
+
+$dummyBackendSetting = New-AzureRmApplicationGatewayBackendHttpSettings -Name "dummySetting01" -Port 80 -Protocol Http -CookieBasedAffinity Disabled
+$dummyBackendPool = New-AzureRmApplicationGatewayBackendAddressPool -Name "dummyBackendPool" -BackendFqdns "dummybackend.com"
+$dummyPathRule = New-AzureRmApplicationGatewayPathRuleConfig -Name "nonexistentapis" -Paths "/*" -BackendAddressPool $dummyBackendPool -BackendHttpSettings $dummyBackendSetting
+$echoapiRule = New-AzureRmApplicationGatewayPathRuleConfig -Name "externalapis" -Paths "/calc/*" -BackendAddressPool $apimProxyBackendPool -BackendHttpSettings $apimPoolSetting
+$urlPathMap = New-AzureRmApplicationGatewayUrlPathMapConfig -Name "urlpathmap" -PathRules $echoapiRule, $dummyPathRule -DefaultBackendAddressPool $dummyBackendPool -DefaultBackendHttpSettings $dummyBackendSetting
+$rule01 = New-AzureRmApplicationGatewayRequestRoutingRule -Name "rule1" -RuleType PathBasedRouting -HttpListener $listener -UrlPathMap $urlPathMap
+$sku = New-AzureRmApplicationGatewaySku -Name "WAF_Medium" -Tier "WAF" -Capacity 1
+$config = New-AzureRmApplicationGatewayWebApplicationFirewallConfiguration -Enabled $true -FirewallMode "Prevention"
+$appgw = New-AzureRmApplicationGateway -Name "apimAppGw" -ResourceGroupName $apimRg  -Location "West Europe" -BackendAddressPools $apimProxyBackendPool, $dummyBackendPool -BackendHttpSettingsCollection $apimPoolSetting, $dummyBackendSetting  -FrontendIpConfigurations $fipconfig01 -GatewayIpConfigurations $gipconfig -FrontendPorts $fp01 -HttpListeners $listener -UrlPathMaps $urlPathMap -RequestRoutingRules $rule01 -Sku $sku -WebApplicationFirewallConfig $config -SslCertificates $cert -AuthenticationCertificates $authcert -Probes $apimprobe
